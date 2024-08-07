@@ -1,65 +1,54 @@
 import runpod
 from utils import create_error_response
 from typing import Any
-from embedding_service import EmbeddingService
+import torch
+from PIL import Image
+import open_clip
+import aiohttp
 
-embedding_service = EmbeddingService()
+model, _, preprocess = open_clip.create_model_and_transforms(
+    "hf-hub:laion/CLIP-ViT-H-14-laion2B-s32B-b79K"
+)
+model.eval()  # model in train mode by default, impacts some models with BatchNorm or stochastic depth active
+tokenizer = open_clip.get_tokenizer("hf-hub:laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
 
 
 async def async_generator_handler(job: dict[str, Any]):
-    """Handle the requests and embedding/rerank them asynchronously."""
-    job_input = job["input"]
-    if job_input.get("openai_route"):
-        openai_route, openai_input = job_input.get("openai_route"), job_input.get(
-            "openai_input"
-        )
+    text = job.get("text")
+    image = job.get("image")
 
-        if openai_route and openai_route == "/v1/models":
-            call_fn, kwargs = embedding_service.route_openai_models, {}
-        elif openai_route and openai_route == "/v1/embeddings":
-            model_name = openai_input.get("model")
-            if not openai_input:
-                return create_error_response("Missing input").model_dump()
-            if not model_name:
-                return create_error_response(
-                    "Did not specify model in openai_input"
-                ).model_dump()
-            call_fn, kwargs = embedding_service.route_openai_get_embeddings, {
-                "embedding_input": openai_input.get("input"),
-                "model_name": model_name,
-                "return_as_list": True,
-            }
-        else:
-            return create_error_response(
-                f"Invalid OpenAI Route: {openai_route}"
-            ).model_dump()
-    else:
-        # handle the request for reranking
-        if job_input.get("query"):
-            call_fn, kwargs = embedding_service.infinity_rerank, {
-                "query": job_input.get("query"),
-                "docs": job_input.get("docs"),
-                "return_docs": job_input.get("return_docs"),
-                "model_name": job_input.get("model"),
-            }
-        elif job_input.get("input"):
-            call_fn, kwargs = embedding_service.route_openai_get_embeddings, {
-                "embedding_input": job_input.get("input"),
-                "model_name": job_input.get("model"),
-            }
-        else:
-            return create_error_response(f"Invalid input: {job}").model_dump()
-    try:
-        out = await call_fn(**kwargs)
-        return out
-    except Exception as e:
-        return create_error_response(str(e)).model_dump()
+    output = {
+        "text_embedding": None,
+        "image_embedding": None,
+    }
+
+    if image:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image) as response:
+                image = Image.open(await response.read())
+
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        image_features = None
+        if image:
+            image_input = preprocess(image).unsqueeze(0).cuda()
+            image_features = model.encode_image(image_input)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+
+            output["image_embedding"] = image_features.cpu().numpy().tolist()
+
+        text_features = None
+        if text:
+            text_features = model.encode_text(text)
+            text_features /= text_features.norm(dim=-1, keepdim=True)
+
+            output["text_embedding"] = text_features.cpu().numpy().tolist()
+
+    return output
 
 
 if __name__ == "__main__":
     runpod.serverless.start(
         {
             "handler": async_generator_handler,
-            "concurrency_modifier": lambda x: embedding_service.config.runpod_max_concurrency,
         }
     )
