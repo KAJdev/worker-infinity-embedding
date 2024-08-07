@@ -1,3 +1,4 @@
 runpod==1.6.2
 aiohttp
 open_clip_torch
+hf_transfer
